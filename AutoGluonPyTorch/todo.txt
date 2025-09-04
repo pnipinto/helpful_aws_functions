@@ -1,0 +1,6 @@
+- do train for parquet (multi file, one folder)
+- avro for inference
+- update architecture
+- use pytorch, latest autogluon framework
+- Sami will do viz
+- how to show real time updating in jupyter notebook
