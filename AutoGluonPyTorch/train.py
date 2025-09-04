@@ -1,8 +1,4 @@
-import os
-import sys
-import time
-import glob
-import argparse
+import os, sys, time, glob, argparse
 from functools import wraps
 
 import pandas as pd
@@ -10,7 +6,7 @@ import pyarrow.parquet as pq
 import mlflow
 
 from autogluon.timeseries import TimeSeriesDataFrame, TimeSeriesPredictor
-from helper_functions import AGTimeSeriesWrapper   # keep this in your source_dir
+from helper_functions import AGTimeSeriesWrapper  # keep this file in source_dir
 
 # ----------------------------
 # Retry helper
@@ -40,14 +36,17 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--output_dir', type=str, default='/opt/ml/model')
 
-    # MLflow (managed tracking server ARN)
+    # MLflow (managed tracking server ARN, like your tabular script)
     p.add_argument('--mlflow_arn', type=str, required=True)
     p.add_argument('--mlflow_experiment', type=str, required=True)
 
-    # Data (SageMaker channel or custom path)
-    p.add_argument('--data_dir', type=str, default=os.environ.get('SM_CHANNEL_TRAINING', '/opt/ml/input/data/training'))
-    p.add_argument('--train-keyword', type=str, default=None)  # filter filenames; None => all
-    p.add_argument('--test-keyword', type=str, default=None)
+    # Data roots (default to SageMaker channels)
+    p.add_argument('--train-dir', type=str, default=os.environ.get('SM_CHANNEL_TRAINING', '/opt/ml/input/data/training'))
+    p.add_argument('--test-dir',  type=str, default=os.environ.get('SM_CHANNEL_TEST', '/opt/ml/input/data/test'))  # empty means "no test"
+
+    # Optional filename filters (empty -> load all)
+    p.add_argument('--train-keyword', type=str, default=None)
+    p.add_argument('--test-keyword',  type=str, default=None)
 
     # Schema
     p.add_argument('--id-col', type=str, default='item_id')
@@ -63,15 +62,26 @@ def parse_args():
     return p.parse_args()
 
 # ----------------------------
-# File discovery
+# File discovery (recursive)
 # ----------------------------
+PARQUET_EXTS = {".parquet", ".PARQUET", ".pq", ".PQ"}
+
 def _find_parquet_files(root: str, keyword: str | None):
-    if not os.path.isdir(root):
+    if not root or not os.path.isdir(root):
         raise FileNotFoundError(f"Data directory not found: {root}")
-    all_files = glob.glob(os.path.join(root, "**", "*.parquet"), recursive=True)
-    files = [f for f in all_files if (keyword in os.path.basename(f))] if keyword else all_files
+    files = []
+    for r, _, fns in os.walk(root):
+        for fn in fns:
+            _, ext = os.path.splitext(fn)
+            if ext in PARQUET_EXTS:
+                if keyword:
+                    if keyword in fn:
+                        files.append(os.path.join(r, fn))
+                else:
+                    files.append(os.path.join(r, fn))
+    print(f"[finder] root={root} keyword={keyword!r} found={len(files)}")
     if not files:
-        raise FileNotFoundError(f"No parquet files in {root} matching keyword='{keyword}'")
+        raise FileNotFoundError(f"No parquet files in {root} (keyword={keyword!r})")
     return sorted(files)
 
 # ----------------------------
@@ -79,14 +89,14 @@ def _find_parquet_files(root: str, keyword: str | None):
 # ----------------------------
 @retry_decorator(max_attempts=3, delay_seconds=30, backoff_factor=2)
 def load_timeseries_parquet(
-    data_dir: str,
+    data_root: str,
     keyword: str | None,
     id_col: str,
     time_col: str,
     target_col: str,
-    covariate_cols: list[str] | None = None,  # e.g. ["random_feature"]
+    covariate_cols: list[str] | None = None,  # e.g., ["random_feature"]
 ):
-    files = _find_parquet_files(data_dir, keyword)
+    files = _find_parquet_files(data_root, keyword)
 
     def resolve(cols: list[str], desired: str, aliases: list[str]) -> str | None:
         norm = {c.strip().lower(): c for c in cols}
@@ -100,9 +110,9 @@ def load_timeseries_parquet(
     for fp in files:
         t = pq.read_table(fp)
         df = t.to_pandas()
-        
-    all_df = pd.concat(frames, ignore_index=True)
-    all_df = all_df.sort_values(["item_id", "timestamp"]).reset_index(drop=True)
+        frames.append(df)
+
+    all_df = pd.concat(frames, ignore_index=True).sort_values(["item_id", "timestamp"]).reset_index(drop=True)
 
     target_tsf = TimeSeriesDataFrame.from_data_frame(
         all_df[["item_id", "timestamp", "target"]],
@@ -112,12 +122,10 @@ def load_timeseries_parquet(
 
     cov_tsf = None
     if covariate_cols:
-        present = [c for c in covariate_cols if c in all_df.columns]  # typically none unless you merged them in
+        present = [c for c in covariate_cols if c in all_df.columns]  # (only if you merged covs into all_df)
         if present:
             cov_df = all_df[["item_id", "timestamp"] + present]
-            cov_tsf = TimeSeriesDataFrame.from_data_frame(
-                cov_df, id_column="item_id", timestamp_column="timestamp"
-            )
+            cov_tsf = TimeSeriesDataFrame.from_data_frame(cov_df, id_column="item_id", timestamp_column="timestamp")
 
     return target_tsf, cov_tsf
 
@@ -127,26 +135,28 @@ def load_timeseries_parquet(
 def main():
     args = parse_args()
 
-    # Managed MLflow (plugin lets ARN be the URI)
+    # MLflow (managed server). Requires sagemaker-mlflow installed in the container.
     mlflow.set_tracking_uri(args.mlflow_arn)
     mlflow.set_experiment(args.mlflow_experiment)
 
-    print(f"[load] train dir={args.data_dir} keyword={args.train_keyword!r}")
+    # TRAIN
+    print(f"[load] train_dir={args.train_dir} keyword={args.train_keyword!r}")
     train_tsf, train_cov_tsf = load_timeseries_parquet(
-        args.data_dir, args.train_keyword, args.id_col, args.time_col, args.target_col,
+        args.train_dir, args.train_keyword, args.id_col, args.time_col, args.target_col,
         covariate_cols=["random_feature"],
     )
 
+    # TEST (optional)
     test_tsf = test_cov_tsf = None
-    if args.test_keyword not in (None, "", "None"):
+    if args.test_dir and os.path.isdir(args.test_dir):
+        print(f"[load] test_dir={args.test_dir} keyword={args.test_keyword!r}")
         try:
-            print(f"[load] test dir={args.data_dir} keyword={args.test_keyword!r}")
             test_tsf, test_cov_tsf = load_timeseries_parquet(
-                args.data_dir, args.test_keyword, args.id_col, args.time_col, args.target_col,
+                args.test_dir, args.test_keyword, args.id_col, args.time_col, args.target_col,
                 covariate_cols=["random_feature"],
             )
-        except FileNotFoundError:
-            print("[load] no test parquet files found — skipping evaluation.")
+        except Exception as e:
+            print(f"[load] test skipped: {e}")
 
     with mlflow.start_run():
         mlflow.log_params({
@@ -154,6 +164,8 @@ def main():
             "eval_metric": args.eval_metric,
             "presets": args.presets,
             "time_limit": args.time_limit,
+            "train_dir": args.train_dir,
+            "test_dir": args.test_dir,
             "train_keyword": args.train_keyword,
             "test_keyword": args.test_keyword,
         })
@@ -166,7 +178,7 @@ def main():
 
         predictor.fit(
             train_data=train_tsf,
-            past_covariates=train_cov_tsf,   # treat random_feature as past covariate
+            past_covariates=train_cov_tsf,    # random_feature as past covariate (change if you want 'known' or 'static')
             presets=args.presets,
             time_limit=args.time_limit,
             num_gpus=args.num_gpus,
@@ -174,14 +186,11 @@ def main():
         predictor.save()
 
         if test_tsf is not None:
-            scores = predictor.evaluate(
-                test_tsf,
-                past_covariates=test_cov_tsf,
-            )
+            scores = predictor.evaluate(test_tsf, past_covariates=test_cov_tsf)
             for k, v in scores.items():
                 mlflow.log_metric(f"test_{k}", float(v))
 
-        # PyFunc (deployable)
+        # Deployable PyFunc
         conda_env = {
             "name": "agts-env",
             "channels": ["conda-forge"],
