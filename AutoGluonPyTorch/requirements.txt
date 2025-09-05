@@ -1,3 +1,4 @@
 mlflow
 autogluon
 sagemaker-mlflow
+fastavro
